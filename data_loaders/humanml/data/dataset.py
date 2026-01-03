@@ -15,6 +15,10 @@ from ..scripts.motion_process import recover_root_rot_pos, recover_from_ric
 from data_loaders.humanml.utils.metrics import cross_combination_joints
 # import spacy
 
+import os, sys
+sys.path.append(r"C:\Users\yun\Documents\GitHub\OmniControl")
+os.chdir(r"C:\Users\yun\Documents\GitHub\OmniControl")
+
 def collate_fn(batch):
     if batch[0][-1] is None:
         batch = [b[:-1] for b in batch]
@@ -166,7 +170,7 @@ class Text2MotionDatasetV2(data.Dataset):
             choose_seq_num = int(length * density / 100)
         choose_seq = np.random.choice(length, choose_seq_num, replace=False)
         choose_seq.sort()
-        mask_seq = np.zeros((length, n_joints, 3)).astype(np.bool)
+        mask_seq = np.zeros((length, n_joints, 3)).astype(np.bool_)
 
         for cj in choose_joint:
             mask_seq[choose_seq, cj] = True
@@ -380,7 +384,7 @@ class TextOnlyDataset(data.Dataset):
 
 # A wrapper class for t2m original dataset for MDM purposes
 class HumanML3D(data.Dataset):
-    def __init__(self, mode, datapath='./dataset/humanml_opt.txt', split="train", control_joint=0, density=100, **kwargs):
+    def __init__(self, mode, datapath='.\\dataset\\humanml_opt.txt', split="train", control_joint=0, density=100, **kwargs):
         self.mode = mode
         
         self.dataset_name = 't2m'
@@ -408,8 +412,8 @@ class HumanML3D(data.Dataset):
             self.std = np.load(pjoin(opt.meta_dir, f'{opt.dataset_name}_std.npy'))
         elif mode in ['train', 'eval', 'text_only']:
             # used by our models
-            self.mean = np.load(pjoin(opt.data_root, 'Mean.npy'))
-            self.std = np.load(pjoin(opt.data_root, 'Std.npy'))
+            self.mean = np.load(pjoin(os.path.abspath(opt.data_root), 'Mean.npy'))
+            self.std = np.load(pjoin(os.path.abspath(opt.data_root), 'Std.npy'))
 
         if mode == 'eval':
             # used by T2M models (including evaluators)
