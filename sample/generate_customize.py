@@ -39,8 +39,6 @@ def main():
     max_frames = 196 if args.dataset in ['kit', 'humanml'] else 60
     fps = 12.5 if args.dataset == 'kit' else 20
     
-    print("Dataset:", args.dataset)
-    
     
     n_frames = min(max_frames, int(args.motion_length*fps))
     n_frames = 196
@@ -119,14 +117,6 @@ def main():
     all_text = []
     all_hint = []
     all_hint_for_vis = []
-    
-    # -----------
-    print("Model kwargs y:", model_kwargs['y'])
-    print("Model kwargs y keys:", model_kwargs['y'].keys())
-    print("Model kwargs y mask.shape:", model_kwargs['y']['mask'].shape)
-    print("Model kwargs y hint.shape:", model_kwargs['y']['hint'].shape)
-    print("Model kwargs y lengths:", model_kwargs['y']['lengths'])
-    # -----------
 
     for rep_i in range(args.num_repetitions):
         print(f'### Sampling [repetitions #{rep_i}]')
@@ -213,11 +203,19 @@ def main():
         shutil.rmtree(out_path)
     os.makedirs(out_path)
 
+
+    #* --------------------------------------------------------------
     npy_path = os.path.join(out_path, 'results.npy')
     print(f"saving results file to [{npy_path}]")
+    
     np.save(npy_path,
-            {'motion': all_motions, 'text': all_text, 'lengths': all_lengths, "hint": all_hint_for_vis,
-             'num_samples': args.num_samples, 'num_repetitions': args.num_repetitions})
+            {'motion': all_motions,
+             'text': all_text,
+             'lengths': all_lengths,
+             "hint": all_hint_for_vis,
+             'num_samples': args.num_samples,
+             'num_repetitions': args.num_repetitions})
+    
     with open(npy_path.replace('.npy', '.txt'), 'w') as fw:
         fw.write('\n'.join(all_text))
     with open(npy_path.replace('.npy', '_len.txt'), 'w') as fw:
@@ -225,6 +223,8 @@ def main():
 
     print(f"saving visualizations to [{out_path}]...")
     skeleton = paramUtil.kit_kinematic_chain if args.dataset == 'kit' else paramUtil.t2m_kinematic_chain
+
+    #* --------------------------------------------------------------
 
     sample_files = []
     num_samples_in_out_file = 7

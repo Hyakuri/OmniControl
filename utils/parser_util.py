@@ -1,5 +1,6 @@
 from argparse import ArgumentParser
 import argparse
+from email.policy import default
 import os
 import json
 
@@ -142,7 +143,7 @@ def add_training_options(parser):
 
 def add_sampling_options(parser):
     group = parser.add_argument_group('sampling')
-    group.add_argument("--model_path", required=True, type=str,
+    group.add_argument("--model_path", default='./save/omnicontrol_ckpt/model_humanml3d.pt', required=True, type=str,
                        help="Path to model####.pt file to be sampled.")
     group.add_argument("--output_dir", default='', type=str,
                        help="Path to results dir (auto created by the script). "
@@ -186,7 +187,7 @@ def add_edit_options(parser):
 
 def add_evaluation_options(parser):
     group = parser.add_argument_group('eval')
-    group.add_argument("--model_path", required=True, type=str,
+    group.add_argument("--model_path", default='./save/omnicontrol_ckpt/model_humanml3d.pt', required=True, type=str,
                        help="Path to model####.pt file to be sampled.")
     group.add_argument("--eval_mode", default='omnicontrol', choices=['omnicontrol'], type=str,
                        help="")

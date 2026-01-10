@@ -21,7 +21,7 @@ estimator_mod: bigru
 eval_every_e: 5
 feat_bias: 5
 fixed_steps: 5
-gpu_id: 3
+gpu_id: 0
 input_z: False
 is_continue: True
 is_train: True

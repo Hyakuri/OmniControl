@@ -1,0 +1,461 @@
+# run_imputation.py
+import argparse
+from multiprocessing.spawn import prepare
+import os, sys
+import numpy as np
+import torch
+
+import pickle
+import os.path as osp
+
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]  # OmniControl/
+sys.path.append(str(ROOT))
+os.chdir(str(ROOT))
+from utils.fixseed import fixseed
+import os
+import numpy as np
+import torch
+from utils.parser_util import generate_args
+from utils.model_util import create_model_and_diffusion, load_model_wo_clip
+from utils import dist_util
+from model.cfg_sampler import ClassifierFreeSampleModel
+from data_loaders.get_data import get_dataset_loader
+from data_loaders.humanml.scripts.motion_process import recover_from_ric
+import data_loaders.humanml.utils.paramUtil as paramUtil
+from data_loaders.humanml.utils.plot_script import plot_3d_motion
+import shutil
+from data_loaders.tensors import collate
+from utils.text_control_example import collate_all
+from os.path import join as pjoin
+
+# 引入你的适配器 (假设你保存为 utils/skeleton_adapter.py)
+# 如果没有分开保存，可以直接把 Adapter 类粘贴在脚本最上方
+class SkeletonAdapter:
+    def __init__(self):
+        self.h36m_structure_dict = {
+               0:"Bottom_torso", 1 : "L_Hip", 2 : "L_Knee", 3 : "L_Foot",
+                4:"R_Hip", 5 : "R_Knee", 6 : "R_Foot", 7 : "Center_torso",
+                8:"Upper_torso", 9 : "Neck", 10 : "Head", 11 : "R_Shoulder",
+                12:"R_Elbow", 13 : "R_Hand", 14 : "L_Shoulder", 15 : "L_Elbow",
+                16:"L_Hand",
+        }
+        
+        self.smpl_structure_dict = {
+               0:"Pelvis", 1 : "L_Hip", 2 : "R_Hip", 3 : "Spine1",
+                4:"L_Knee", 5 : "R_Knee", 6 : "Spine2", 7 : "L_Ankle",
+                8:"R_Ankle", 9 : "Spine3", 10 : "L_Toe", 11 : "R_Toe",
+                12:"Neck", 13: "L_Collar", 14 : "R_Collar", 15 : "Head",
+                16:"L_Shoulder", 17 : "R_Shoulder", 18 : "L_Elbow",
+                19:"R_Elbow", 20 : "L_Hand", 21 : "R_Hand",
+        }
+        pass
+
+    def h36m_to_smpl22(self, h36m_data):
+        """
+        将 Human3.6M (17点, Y-Down) -> SMPL (22点, Y-Up)
+        
+        参数:
+            h36m_data: (Frames, 17, 3)
+        返回:
+            smpl_data: (Frames, 22, 3)
+        """
+        # 1. 坐标系转换 (Fix Coordinate System)
+        # 复制一份以免修改原数据
+        h36m_data = h36m_data.copy()
+        
+        # 归一化/去中心化: 将骨盆 (Index 0) 移到原点
+        # 这一步非常重要，因为两个数据的绝对Z值(深度)差异很大
+        root = h36m_data[:, 0:1, :].copy()
+        h36m_data = h36m_data - root
+        
+        #* 翻转 Y 轴: H36M是Y向下，SMPL是Y向上
+        h36m_data[:, :, 1] *= -1
+        
+        # 2. 关节点映射 (Joint Mapping)
+        frames = h36m_data.shape[0]
+        smpl_data = np.zeros((frames, 22, 3), dtype=h36m_data.dtype)
+        
+        # --- 直接映射 ---
+        # Body
+        smpl_data[:, 0] = h36m_data[:, 0]   # Pelvis
+        smpl_data[:, 3] = h36m_data[:, 7]   # Spine1 <- Center torso
+        
+        if h36m_data[:, 7].all() == 0.0 or h36m_data[:, 8].all() == 0.0:
+            smpl_data[:, 6] = 0.0
+        else:
+            smpl_data[:, 6] = (h36m_data[:, 7] + h36m_data[:, 8]) / 2.0 # Spine2 (插值)
+        smpl_data[:, 9] = h36m_data[:, 8]   # Spine3 <- Upper torso
+        smpl_data[:, 12] = h36m_data[:, 9]  # Neck
+        smpl_data[:, 15] = h36m_data[:, 10] # Head
+        
+        # Legs (H36M: Hip->Knee->Foot) -> SMPL (Hip->Knee->Ankle)
+        smpl_data[:, 1] = h36m_data[:, 1]   # L_Hip
+        smpl_data[:, 4] = h36m_data[:, 2]   # L_Knee
+        smpl_data[:, 7] = h36m_data[:, 3]   # L_Ankle
+        
+        smpl_data[:, 2] = h36m_data[:, 4]   # R_Hip
+        smpl_data[:, 5] = h36m_data[:, 5]   # R_Knee
+        smpl_data[:, 8] = h36m_data[:, 6]   # R_Ankle
+        
+        # L_Foot/Toe (Index 10) & R_Foot/Toe (Index 11):
+        # H36M 没有脚尖数据。我们暂时将其设置为与 Ankle 重合，或者稍微向下延伸一点。
+        # 为了 Inpainting 方便，建议设为与 Ankle 重合，但在 Mask 中将其标记为"缺失"，让模型去生成。
+        # smpl_data[:, 10] = smpl_data[:, 7] # L_Toe = L_Ankle
+        # smpl_data[:, 11] = smpl_data[:, 8] # R_Toe = R_Ankle
+        # smpl_data[:, 10] = smpl_data[:, 7] + np.array([0, 0, -0.05])  # L_Toe 略微向下
+        # smpl_data[:, 11] = smpl_data[:, 8] + np.array([0, 0, -0.05])  # R_Toe 略微向下
+        smpl_data[:, 10] = 0.0      # L_Toe 标记为缺失
+        smpl_data[:, 11] = 0.0      # R_Toe 标记为缺失
+        
+        
+        # Arms
+        # Collars (锁骨) 插值: 在 Spine3 和 Shoulder 之间
+        if h36m_data[:, 8].all() == 0.0 or h36m_data[:, 14].all() == 0.0:
+            smpl_data[:, 13] = 0.0
+        else:
+            smpl_data[:, 13] = h36m_data[:, 8] * 0.75 + h36m_data[:, 14] * 0.25 # L_Collar
+        
+        if h36m_data[:, 8].all() == 0.0 or h36m_data[:, 11].all() == 0.0:
+            smpl_data[:, 14] = 0.0
+        else:
+            smpl_data[:, 14] = h36m_data[:, 8] * 0.75 + h36m_data[:, 11] * 0.25 # R_Collar
+        
+        smpl_data[:, 16] = h36m_data[:, 14] # L_Shoulder
+        smpl_data[:, 18] = h36m_data[:, 15] # L_Elbow
+        smpl_data[:, 20] = h36m_data[:, 16] # L_Hand
+        
+        smpl_data[:, 17] = h36m_data[:, 11] # R_Shoulder
+        smpl_data[:, 19] = h36m_data[:, 12] # R_Elbow
+        smpl_data[:, 21] = h36m_data[:, 13] # R_Hand
+        
+        return smpl_data
+
+    def smpl22_to_h36m(self, smpl_data, original_root=None):
+        """
+        将 SMPL (22点, Y-Up) -> Human3.6M (17点, Y-Down)
+        
+        参数:
+            smpl_data: (Frames, 22, 3)
+            original_root: (Frames, 1, 3) 可选，用于将生成的骨骼还原回原始绝对位置
+        """
+        data = smpl_data.copy()
+        frames = data.shape[0]
+        h36m = np.zeros((frames, 17, 3), dtype=data.dtype)
+        
+        # 1. 关节点还原
+        h36m[:, 0] = data[:, 0]   # Pelvis
+        h36m[:, 1] = data[:, 1]   # L_Hip
+        h36m[:, 2] = data[:, 4]   # L_Knee
+        h36m[:, 3] = data[:, 7]   # L_Foot
+        
+        h36m[:, 4] = data[:, 2]   # R_Hip
+        h36m[:, 5] = data[:, 5]   # R_Knee
+        h36m[:, 6] = data[:, 8]   # R_Foot
+        
+        h36m[:, 7] = data[:, 3]   # Center Torso
+        h36m[:, 8] = data[:, 9]   # Upper Torso
+        h36m[:, 9] = data[:, 12]  # Neck
+        h36m[:, 10] = data[:, 15] # Head
+        
+        h36m[:, 11] = data[:, 17] # R_Shoulder
+        h36m[:, 12] = data[:, 19] # R_Elbow
+        h36m[:, 13] = data[:, 21] # R_Hand
+        
+        h36m[:, 14] = data[:, 16] # L_Shoulder
+        h36m[:, 15] = data[:, 18] # L_Elbow
+        h36m[:, 16] = data[:, 20] # L_Hand
+        
+        #* 2. 坐标系还原 (Y-Flip)
+        h36m[:, :, 1] *= -1
+        
+        # 3. 绝对位置还原 (如果有原始Root信息)
+        if original_root is not None:
+            h36m = h36m + original_root
+            
+        return h36m
+import sys
+import os
+from pathlib import Path
+import numpy as np
+import torch
+
+# --- 1. 路径设置 ---
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
+os.chdir(str(ROOT))
+
+from utils.fixseed import fixseed
+from utils.parser_util import generate_args
+from utils.model_util import create_model_and_diffusion, load_model_wo_clip
+from data_loaders.get_data import get_dataset_loader
+from data_loaders.humanml.scripts.motion_process import recover_from_ric
+
+
+def load_dataset_helper(args, max_frames, n_frames):
+    data = get_dataset_loader(name=args.dataset,
+                              batch_size=args.batch_size,
+                              num_frames=max_frames,
+                              split='test',
+                              hml_mode='train')
+    if args.dataset in ['kit', 'humanml']:
+        data.dataset.t2m_dataset.fixed_length = n_frames
+    return data
+
+def main(prepare_kpts:np.ndarray=None, prepare_mask:np.ndarray=None, results_output_dirpath:str=None):
+    # --- A. 初始化 ---
+    args = generate_args()
+    fixseed(args.seed)
+    
+    vis_output_dir = pjoin(results_output_dirpath, 'visualize') if results_output_dirpath is not None else pjoin(ROOT, 'results', 'sars_imputation_results', 'visualize')
+    if not os.path.exists(vis_output_dir):
+        os.makedirs(vis_output_dir, exist_ok=True)
+    print(f"Visualization results will be saved to: {vis_output_dir}")
+    
+    # 获取骨骼运动链定义 (用于画图连线)
+    # OmniControl 基于 HumanML3D，所以使用 t2m_kinematic_chain
+    kinematic_chain = paramUtil.t2m_kinematic_chain
+    
+    # 定义你的生成配置
+    NUM_REPETITIONS = 10  # 每种动作生成 10 份 (作为一个 Batch 处理)
+    args.batch_size = NUM_REPETITIONS # 显存允许的话，直接设为 10
+    
+    args.model_path = "./save/omnicontrol_ckpt/model_humanml3d.pt"
+    args.dataset = 'humanml'
+    args.num_samples = 1
+    
+    max_frames = 196 if args.dataset in ['kit', 'humanml'] else 60
+    n_frames = 196 # 你的数据帧数
+    
+    # 定义 5 种动作的文本提示 (请根据你的需求修改)
+    TARGET_ACTIONS = [
+        "a person is moving forward",
+        "a person is carrying a piece of wood while walking",
+        "a person is climbing up on a ladder",
+        "a person is working for roof on a ladder",
+        "a person is working for measuring and cutting wood using a slide saw at a table"
+    ]
+    NUM_ACTIONS = len(TARGET_ACTIONS)
+    
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+
+    # --- B. 加载数据集元数据 ---
+    print('Loading dataset wrapper...')
+    data = load_dataset_helper(args, max_frames, n_frames)
+
+    # --- C. 加载模型 ---
+    print("Creating model...")
+    model, diffusion = create_model_and_diffusion(args, data)
+    print(f"Loading checkpoints from [{args.model_path}]...")
+    state_dict = torch.load(args.model_path, map_location='cpu')
+    load_model_wo_clip(model, state_dict)
+    model.to(device)
+    model.eval()
+
+    # --- D. 数据准备 ---
+    print("Preparing input data...")
+    prepare_kpts = prepare_kpts.reshape(prepare_kpts.shape[0], prepare_kpts.shape[1], -1)  # (B, Frames, 22, 3) -> (B, Frames, 66)
+    prepare_mask = prepare_mask  # (B, 1, 1, Frames)
+    
+    assert prepare_kpts.shape[1] == n_frames, f"Input keypoints frames {prepare_kpts.shape[1]} does not match expected {n_frames}"
+    assert prepare_mask.shape[-1] == n_frames, f"Input mask frames {prepare_mask.shape[-1]} does not match expected {n_frames}"
+    
+    # 结果容器: (Samples, Actions, Reps, Frames, 22, 3)
+    final_results_container = []
+
+    # --- E. 开始循环生成 ---
+    # 外层循环：遍历每一个样本
+    for sample_idx in range(prepare_kpts.shape[0]):
+        print(f"Processing sample {sample_idx+1}/{prepare_kpts.shape[0]}...")
+        
+        # 获取当前样本的 hint 和 mask
+        # current_hint: (Frames, 66)
+        # current_mask: (1, 1, Frames)
+        current_hint_np = prepare_kpts[sample_idx]
+        current_mask_np = prepare_mask[sample_idx]
+        
+        sample_action_results = [] # 存放该样本的 5 种动作结果
+        
+        #* 内层循环：遍历 5 种动作
+        for action_idx, action_text in enumerate(TARGET_ACTIONS):
+            print(f"  > Generating Action: '{action_text}' ({NUM_REPETITIONS} reps)...")
+            
+            # --- 构造 Batch (Replication) ---
+            # 我们将单个样本复制 10 份，组成一个 Batch
+            
+            # 1. Hint: (10, Frames, 66)
+            batch_hint_np = np.tile(current_hint_np[np.newaxis, ...], (NUM_REPETITIONS, 1, 1))
+            batch_hint = torch.from_numpy(batch_hint_np).float().to(device)
+            # 调整为模型需要的 (Batch, Frames, Feats) -> 这里的 66 就是 Feats
+            # 注意: 之前我们确认了不需要 permute，直接是 (B, T, D) 即可
+            
+            # 2. Mask: (10, 1, 1, Frames)
+            batch_mask_np = np.tile(current_mask_np[np.newaxis, ...], (NUM_REPETITIONS, 1, 1, 1))
+            batch_mask = torch.from_numpy(batch_mask_np).bool().to(device)      # 转为 Bool
+            
+            # 3. Text: 10 个相同的 Prompt
+            batch_texts = [action_text] * NUM_REPETITIONS
+            
+            # 4. Lengths
+            batch_lengths = torch.tensor([n_frames] * NUM_REPETITIONS).to(device)
+
+            # --- 构造输入字典 ---
+            model_kwargs = {
+                'y': {
+                    'text': batch_texts,
+                    'lengths': batch_lengths,
+                    'hint': batch_hint,     # (10, Frames, 66)
+                    'mask': batch_mask,     # (10, 1, 1, Frames)
+                    'scale': torch.ones(NUM_REPETITIONS, device=device) * args.guidance_param
+                }
+            }
+            
+            # --- 执行生成 ---
+            # 一次生成 10 个 Repetitions
+            sample = diffusion.p_sample_loop(
+                model,
+                (NUM_REPETITIONS, model.njoints, model.nfeats, n_frames),
+                clip_denoised=False,
+                model_kwargs=model_kwargs,
+                skip_timesteps=0,
+                progress=False, # 关闭内部进度条以免刷屏
+                const_noise=False, # 关键：确保随机噪声不同，这样10个结果才会有差异
+            )
+            
+            # --- 后处理 (Batch Processing) ---
+            # 1. 提取有效特征 & 反归一化
+            sample = sample[:, :263]        # why 263? 因为 HumanML3D 有 263 个有效特征
+            sample = data.dataset.t2m_dataset.inv_transform(sample.cpu().permute(0, 2, 3, 1)).float()
+            
+            # 2. 恢复 XYZ
+            n_joints = 22 if sample.shape[-1] == 263 else 21
+            sample = recover_from_ric(sample, n_joints) # (10, 1, Frames, 22, 3)
+            
+            # 3. 调整维度
+            sample = sample.squeeze(1) # (10, Frames, 22, 3)
+            sample = sample[:, :n_frames, :, :]
+            
+            # 4. 存入临时列表
+            # sample shape: (10, 64, 22, 3)
+            sample_action_results.append(sample.cpu().numpy())
+            
+            
+            # =======================================================
+            # 5. 可视化模块 (只生成 Batch 中的第 0 个样本)
+            # =======================================================
+            try:
+                # A. 提取第 0 个生成的动作 (作为代表)
+                # shape: (64, 22, 3)
+                vis_motion = sample[0].cpu().numpy()
+                
+                # B. 准备 Hint 数据 (用于在图中画出红色的观测点)
+                # current_hint_np 是 (64, 66)，需要变回 (64, 22, 3)
+                vis_hint = current_hint_np.reshape(n_frames, 22, 3)
+                
+                # C. 构造文件名
+                # 格式: sample_01_action_01_climbing.mp4
+                save_title = action_text.replace(" ", "_").replace(".", "")[:20]
+                save_filename = f"sample_{sample_idx:02d}_action_{action_idx:02d}_{save_title}.mp4"
+                save_path = os.path.join(vis_output_dir, save_filename)
+                
+                # D. 调用 OmniControl 的绘图函数
+                # 注意: title 是显示在视频顶部的文字，fps 建议设为 20
+                print(f"    -> Saving visualization to {save_filename}")
+                plot_3d_motion(
+                    save_path, 
+                    kinematic_chain, 
+                    vis_motion, 
+                    dataset=args.dataset, 
+                    title=action_text, 
+                    fps=20, 
+                    hint=vis_hint 
+                )
+            except Exception as e:
+                print(f"    [Warning] Visualization failed: {e}")
+    
+        # --- 保存该样本的所有动作结果 ---
+        # 将该样本的所有动作结果堆叠
+        # shape: (Motion_Categories, Motion_repetitions, Frames, 22, 3)
+        sample_action_results = np.stack(sample_action_results, axis=0)
+        final_results_container.append(sample_action_results)
+    
+    
+    # --- F. 保存最终大文件 ---
+    # 最终形状: (Num_Samples, Num_Actions, Num_Reps, Frames, 22, 3)
+    final_results = np.stack(final_results_container, axis=0)
+    
+    print(f"\nAll Done!")
+    print(f"Final Data Shape: {final_results.shape}")
+    # 例如: (2, 5, 10, 64, 22, 3)
+    
+    results_output_abspath = osp.join(results_output_dirpath, "sars_imputation_results.npy") if results_output_dirpath is not None else "./results/sars_imputation_results.npy"
+    np.save(results_output_abspath, final_results)
+    print(f"Results saved to: {results_output_abspath}")
+    
+    # 额外保存一下动作列表，方便后续对应
+    with open(osp.join(results_output_dirpath, "sars_imputation_action_list.txt"), "w") as f:
+        for act in TARGET_ACTIONS:
+            f.write(act + "\n")
+    
+    ...
+    
+
+    # # --- H. 还原回 H36M 并保存 ---
+    # restored_list = []
+    # sample_np = sample.cpu().numpy()
+    
+    # for i in range(args.batch_size):
+    #     # 现在 sample_np[i] 是 (Frames, 22, 3)，完全符合适配器要求
+    #     h36m_res = adapter.smpl22_to_h36m(sample_np[i])
+    #     restored_list.append(h36m_res)
+        
+    # final_result = np.array(restored_list)
+    # output_path = osp.join(osp.dirname(__file__), '..', 'save', "inpainted_results.npy")
+    # np.save(output_path, final_result)
+    # print(f"Done. Result shape: {final_result.shape}. Saved to {output_path}")
+
+if __name__ == "__main__":
+    # --- 强制注入命令行参数 ---
+    # 如果检测到没有输入参数（直接点击运行时），自动填入默认参数
+    import sys
+    import re
+    if len(sys.argv) == 1: 
+        print("Detected direct run. Injecting default arguments...")
+        sys.argv.extend([
+            "--model_path", "./save/omnicontrol_ckpt/model_humanml3d.pt",
+            # 如果还有其他必须参数，也可以在这里继续添加
+            # "--text_prompt", "A person is walking" 
+        ])
+    
+    if sys.platform == 'win32' or sys.platform == 'cygwin':
+        HHD_ROOT = "K:\\"
+    elif sys.platform == 'linux':
+        HHD_ROOT = f"/media/{USER_NAME}/HHD_K/"
+    
+    
+    Prepare_target_dirname = "CustomDataset_20241214_G_202512261305"
+    
+    
+    mask_cat = ['upper', 'bottom', 'left', 'right', 'left_hand', 'right_hand', 'left_leg', 'right_leg', 'inter', 'norm']
+    target_maskList = []
+    for mask_id in target_maskList if len(target_maskList) > 0 else mask_cat:
+        if mask_id == 'norm':       continue
+        
+        # --------------------------
+        Prepare_dataset_dirpath = osp.join(HHD_ROOT, 'SARS-Inter_DL', 'G_Prepare', Prepare_target_dirname, mask_id)
+        
+        prepare_kpts_path = [osp.join(Prepare_dataset_dirpath, file) for file in os.listdir(Prepare_dataset_dirpath) if re.search(f'\w*_kpts\.npy$', file)][-1]
+        prepare_mask_path = [osp.join(Prepare_dataset_dirpath, file) for file in os.listdir(Prepare_dataset_dirpath) if re.search(f'\w*_mask\.npy$', file)][-1]
+        
+        assert osp.exists(prepare_kpts_path), f"prepare_kpts_path not found: {prepare_kpts_path}"
+        assert osp.exists(prepare_mask_path), f"prepare_mask_path not found: {prepare_mask_path}"
+        
+        prepare_kpts = np.load(prepare_kpts_path)   # (N, 196, 22, 3)
+        prepare_mask = np.load(prepare_mask_path)   # (N, 1, 1, 22)
+        # --------------------------
+    
+        main(prepare_kpts, prepare_mask, Prepare_dataset_dirpath)

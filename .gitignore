@@ -139,3 +139,7 @@ hint.npy
 t2m
 submit.sh
 scripts_/
+
+# Dataset
+dataset/*
+download/*
