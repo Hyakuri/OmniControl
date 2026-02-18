@@ -669,3 +669,10 @@ def collate_all(n_frames, dataset):
     texts = texts0 + texts1 + texts2 + texts3 + texts4 + texts5 + texts6 + texts7
     hints = np.concatenate([hints0, hints1, hints2, hints3, hints4, hints5, hints6, hints7], axis=0)
     return texts, hints
+
+if __name__ == '__main__':
+    n_frames = 196
+    dataset = 'humanml'
+    texts, hints = collate_all(n_frames, dataset)
+    print(texts)
+    print(hints.shape)

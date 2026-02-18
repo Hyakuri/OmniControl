@@ -23,11 +23,13 @@ from model.cfg_sampler import ClassifierFreeSampleModel
 from data_loaders.get_data import get_dataset_loader
 from data_loaders.humanml.scripts.motion_process import recover_from_ric
 import data_loaders.humanml.utils.paramUtil as paramUtil
-from data_loaders.humanml.utils.plot_script import plot_3d_motion
+from data_loaders.humanml.utils.plot_script import plot_3d_motion, plot_compare_3d_motion
 import shutil
 from data_loaders.tensors import collate
 from utils.text_control_example import collate_all
 from os.path import join as pjoin
+
+import time
 
 # 引入你的适配器 (假设你保存为 utils/skeleton_adapter.py)
 # 如果没有分开保存，可以直接把 Adapter 类粘贴在脚本最上方
@@ -204,7 +206,34 @@ def load_dataset_helper(args, max_frames, n_frames):
         data.dataset.t2m_dataset.fixed_length = n_frames
     return data
 
-def main(prepare_kpts:np.ndarray=None, prepare_mask:np.ndarray=None, results_output_dirpath:str=None):
+def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareData_input_dirpath:str=None, results_output_dirpath:str=None):
+    """
+    该函数执行 SARS 动作补全任务，使用 OmniControl 模型根据部分观测点和文本提示生成完整的骨骼动作序列。
+    
+    :param prepare_kpts: Prepared keypoints array of shape (N, Frames, 22, 3), defaults to None
+    :param prepare_filter: Prepared filter array of shape (N, 1, 1, Frames), defaults to None
+    :param PrepareData_input_dirpath: Directory path of prepared input data, defaults to None
+    :param results_output_dirpath: Directory path to save results, defaults to None
+    """
+    # --- 0. 前置检查&数据备份 ---
+    if PrepareData_input_dirpath is not None and not os.path.exists(PrepareData_input_dirpath):
+        raise FileNotFoundError(f"PrepareData_input_dirpath does not exist: {PrepareData_input_dirpath}")
+    if results_output_dirpath is not None and not os.path.exists(results_output_dirpath):
+        os.makedirs(results_output_dirpath, exist_ok=True)
+    
+    
+    # Copy .npy files from prepare directory to results directory
+    if PrepareData_input_dirpath:
+        for root, dirs, files in os.walk(PrepareData_input_dirpath):
+            for file in files:
+                if file.endswith('.npy') or file.endswith('.pkl'):
+                    src = os.path.join(root, file)
+                    dst = os.path.join(results_output_dirpath, 
+                                      os.path.relpath(src, PrepareData_input_dirpath))
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy2(src, dst)
+    
+    
     # --- A. 初始化 ---
     args = generate_args()
     fixseed(args.seed)
@@ -243,9 +272,27 @@ def main(prepare_kpts:np.ndarray=None, prepare_mask:np.ndarray=None, results_out
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
 
-    # --- B. 加载数据集元数据 ---
+    # --- B1. 加载数据集元数据 ---
     print('Loading dataset wrapper...')
     data = load_dataset_helper(args, max_frames, n_frames)
+    
+    
+    # --- [新增] B2. 加载归一化统计量 (Normalization Stats) ---
+    print("Loading normalization statistics...")
+    spatial_norm_path = './dataset/humanml_spatial_norm'
+    # 确保文件存在，路径需根据项目结构调整
+    mean_path = pjoin(spatial_norm_path, 'Mean_raw.npy')
+    std_path = pjoin(spatial_norm_path, 'Std_raw.npy')
+    assert os.path.exists(mean_path), f"Mean_raw.npy not found at {mean_path}"
+    assert os.path.exists(std_path), f"Std_raw.npy not found at {std_path}"
+    # 加载并转换为 Tensor
+    raw_mean_np = np.load(mean_path)
+    raw_std_np = np.load(std_path)
+    # 形状 (22, 3) -> 压平 -> (1, 1, 66)
+    raw_mean = torch.from_numpy(raw_mean_np.reshape(1, 1, -1)).float().to(device)
+    raw_std = torch.from_numpy(raw_std_np.reshape(1, 1, -1)).float().to(device)
+    
+    
 
     # --- C. 加载模型 ---
     print("Creating model...")
@@ -258,11 +305,12 @@ def main(prepare_kpts:np.ndarray=None, prepare_mask:np.ndarray=None, results_out
 
     # --- D. 数据准备 ---
     print("Preparing input data...")
+    # prepare_kpts 输入形状为 (B, Frames, 22, 3) -> 需要调整为 (B, Frames, 66)
     prepare_kpts = prepare_kpts.reshape(prepare_kpts.shape[0], prepare_kpts.shape[1], -1)  # (B, Frames, 22, 3) -> (B, Frames, 66)
-    prepare_mask = prepare_mask  # (B, 1, 1, Frames)
+    prepare_filter = prepare_filter  # (B, 1, 1, Frames)
     
     assert prepare_kpts.shape[1] == n_frames, f"Input keypoints frames {prepare_kpts.shape[1]} does not match expected {n_frames}"
-    assert prepare_mask.shape[-1] == n_frames, f"Input mask frames {prepare_mask.shape[-1]} does not match expected {n_frames}"
+    assert prepare_filter.shape[-1] == n_frames, f"Input mask frames {prepare_filter.shape[-1]} does not match expected {n_frames}"
     
     # 结果容器: (Samples, Actions, Reps, Frames, 22, 3)
     final_results_container = []
@@ -275,8 +323,8 @@ def main(prepare_kpts:np.ndarray=None, prepare_mask:np.ndarray=None, results_out
         # 获取当前样本的 hint 和 mask
         # current_hint: (Frames, 66)
         # current_mask: (1, 1, Frames)
-        current_hint_np = prepare_kpts[sample_idx]
-        current_mask_np = prepare_mask[sample_idx]
+        target_hint_np = prepare_kpts[sample_idx]
+        target_filter_np = prepare_filter[sample_idx]
         
         sample_action_results = [] # 存放该样本的 5 种动作结果
         
@@ -284,18 +332,37 @@ def main(prepare_kpts:np.ndarray=None, prepare_mask:np.ndarray=None, results_out
         for action_idx, action_text in enumerate(TARGET_ACTIONS):
             print(f"  > Generating Action: '{action_text}' ({NUM_REPETITIONS} reps)...")
             
-            # --- 构造 Batch (Replication) ---
+            # --- 1. 构造 Hint Batch (Replication) ---
             # 我们将单个样本复制 10 份，组成一个 Batch
             
             # 1. Hint: (10, Frames, 66)
-            batch_hint_np = np.tile(current_hint_np[np.newaxis, ...], (NUM_REPETITIONS, 1, 1))
-            batch_hint = torch.from_numpy(batch_hint_np).float().to(device)
             # 调整为模型需要的 (Batch, Frames, Feats) -> 这里的 66 就是 Feats
             # 注意: 之前我们确认了不需要 permute，直接是 (B, T, D) 即可
+            batch_hint_np = np.tile(target_hint_np[np.newaxis, ...], (NUM_REPETITIONS, 1, 1))
+            batch_hint = torch.from_numpy(batch_hint_np).float().to(device)
             
-            # 2. Mask: (10, 1, 1, Frames)
-            batch_mask_np = np.tile(current_mask_np[np.newaxis, ...], (NUM_REPETITIONS, 1, 1, 1))
-            batch_mask = torch.from_numpy(batch_mask_np).bool().to(device)      # 转为 Bool
+            #* --- 2. 执行数据归一化 ---
+            # A. 创建空间掩码 (Spatial Hint Filter)：重新筛选并标记获取的数据中哪些点是有效的（非0）
+            #    注意：原始数据中 0.0 代表缺失．
+            #    形状: (10, Frames, 66): 非0位置为 1.0，0 位置为 0.0
+            batch_spatial_hintFilter = (batch_hint.abs() > 1e-6).float()
+            
+            # B. 应用归一化公式: (X - Mean) / Std
+            #    HumanML3D 的 Mean/Std 是基于 Y-up 坐标系的，请确保你的 prepare_kpts 已经是 Y-up
+            batch_hint_norm = (batch_hint - raw_mean) / raw_std
+            
+            # C. 重新应用掩码：将原本是 0 的地方（现在变成了 -Mean/Std）强制置回 0
+            #    这是最关键的一步，告诉模型这些点是缺失的
+            batch_norm_hint = batch_hint_norm * batch_spatial_hintFilter
+            # 现在 batch_hint_final 就是最终的归一化 Hint 输入
+            # ------------------------------------------------------
+            
+            #* --- 3. 构造 Mask Batch (Temporal/Length Mask) ---
+            # OmniControl 通常使用这个 mask 来指示序列长度，mask 由 lengths_to_mask 生成，用于标记序列实际长度。它的形状为 [batch, 1, 1, max_len]，可用于广播，告诉模型哪些帧有效。在 sample/generate.py 中，mask 被用在 rot2xyz 时构造时间步掩码（非 xyz 表示时）
+            # mask 就是 “有效帧掩码”，表示哪些时间步是真实数据、哪些是 padding
+            # 既然是定长生成 (196帧)，这里可以用全 True，或者沿用传入的 mask
+            batch_temporal_filter_np = np.tile(target_filter_np[np.newaxis, ...], (NUM_REPETITIONS, 1, 1, 1))
+            batch_temporal_filter = torch.from_numpy(batch_temporal_filter_np).bool().to(device)      # 转为 Bool
             
             # 3. Text: 10 个相同的 Prompt
             batch_texts = [action_text] * NUM_REPETITIONS
@@ -308,8 +375,8 @@ def main(prepare_kpts:np.ndarray=None, prepare_mask:np.ndarray=None, results_out
                 'y': {
                     'text': batch_texts,
                     'lengths': batch_lengths,
-                    'hint': batch_hint,     # (10, Frames, 66)
-                    'mask': batch_mask,     # (10, 1, 1, Frames)
+                    'hint': batch_norm_hint,     # (10, Frames, 66)
+                    'mask': batch_temporal_filter,     # (10, 1, 1, Frames)
                     'scale': torch.ones(NUM_REPETITIONS, device=device) * args.guidance_param
                 }
             }
@@ -323,7 +390,7 @@ def main(prepare_kpts:np.ndarray=None, prepare_mask:np.ndarray=None, results_out
                 model_kwargs=model_kwargs,
                 skip_timesteps=0,
                 progress=False, # 关闭内部进度条以免刷屏
-                const_noise=False, # 关键：确保随机噪声不同，这样10个结果才会有差异
+                const_noise=False, # 关键：关闭固定噪声，确保随机噪声不同，这样10个结果才会有差异
             )
             
             # --- 后处理 (Batch Processing) ---
@@ -331,16 +398,17 @@ def main(prepare_kpts:np.ndarray=None, prepare_mask:np.ndarray=None, results_out
             sample = sample[:, :263]        # why 263? 因为 HumanML3D 有 263 个有效特征
             sample = data.dataset.t2m_dataset.inv_transform(sample.cpu().permute(0, 2, 3, 1)).float()
             
-            # 2. 恢复 XYZ
+            # 2. 恢复 XYZ, 为什么要恢复 XYZ? 因为模型输出的是旋转不变的坐标，需要转换回全局坐标系下的关节位置
             n_joints = 22 if sample.shape[-1] == 263 else 21
             sample = recover_from_ric(sample, n_joints) # (10, 1, Frames, 22, 3)
             
-            # 3. 调整维度
+            # 3. 调整维度 (10, 1, Frames, 22, 3) -> (10, Frames, 22, 3)
             sample = sample.squeeze(1) # (10, Frames, 22, 3)
-            sample = sample[:, :n_frames, :, :]
+            print(f"    Generated sample shape: {sample.shape}")
+            sample = sample[:, :n_frames, :, :] # 截断到 n_frames, why? 以防万一模型输出多帧 (10, Frames, 22, 3)，但理论上不会
             
             # 4. 存入临时列表
-            # sample shape: (10, 64, 22, 3)
+            # sample shape: (10, Frames, 22, 3)
             sample_action_results.append(sample.cpu().numpy())
             
             
@@ -349,12 +417,12 @@ def main(prepare_kpts:np.ndarray=None, prepare_mask:np.ndarray=None, results_out
             # =======================================================
             try:
                 # A. 提取第 0 个生成的动作 (作为代表)
-                # shape: (64, 22, 3)
+                # shape: (Frames, 22, 3)
                 vis_motion = sample[0].cpu().numpy()
                 
                 # B. 准备 Hint 数据 (用于在图中画出红色的观测点)
-                # current_hint_np 是 (64, 66)，需要变回 (64, 22, 3)
-                vis_hint = current_hint_np.reshape(n_frames, 22, 3)
+                # current_hint_np 是 (Frames, 66)，需要变回骨骼结构 (Frames, 22, 3)
+                vis_hint = target_hint_np.reshape(n_frames, 22, 3)
                 
                 # C. 构造文件名
                 # 格式: sample_01_action_01_climbing.mp4
@@ -364,16 +432,26 @@ def main(prepare_kpts:np.ndarray=None, prepare_mask:np.ndarray=None, results_out
                 
                 # D. 调用 OmniControl 的绘图函数
                 # 注意: title 是显示在视频顶部的文字，fps 建议设为 20
-                print(f"    -> Saving visualization to {save_filename}")
-                plot_3d_motion(
-                    save_path, 
-                    kinematic_chain, 
-                    vis_motion, 
-                    dataset=args.dataset, 
-                    title=action_text, 
-                    fps=20, 
-                    hint=vis_hint 
+                print(f"    -> Saving visualization to {save_path} ...")
+                # plot_3d_motion(
+                #     save_path, 
+                #     kinematic_chain, 
+                #     vis_motion, 
+                #     dataset=args.dataset, 
+                #     title=action_text, 
+                #     fps=20, 
+                #     hint=vis_hint 
+                # )
+                plot_compare_3d_motion(
+                    save_path,
+                    kinematic_chain,
+                    vis_motion,
+                    dataset=args.dataset,
+                    title=action_text,
+                    fps=20,
+                    hint=vis_hint
                 )
+                
             except Exception as e:
                 print(f"    [Warning] Visualization failed: {e}")
     
@@ -437,7 +515,9 @@ if __name__ == "__main__":
         HHD_ROOT = f"/media/{USER_NAME}/HHD_K/"
     
     
-    Prepare_target_dirname = "CustomDataset_20241214_G_202512261305"
+    Prepare_target_dirname = "CustomDataset_20241214_GP_202602161701"
+    Output_target_dirname = "CustomDataset_20241214_GP_202512261305" + "_GG_{}".format(time.strftime('%Y%m%d%H%M', time.localtime()))
+    
     
     
     mask_cat = ['upper', 'bottom', 'left', 'right', 'left_hand', 'right_hand', 'left_leg', 'right_leg', 'inter', 'norm']
@@ -446,10 +526,14 @@ if __name__ == "__main__":
         if mask_id == 'norm':       continue
         
         # --------------------------
-        Prepare_dataset_dirpath = osp.join(HHD_ROOT, 'SARS-Inter_DL', 'G_Prepare', Prepare_target_dirname, mask_id)
+        PrepareData_input_dirpath = osp.join(HHD_ROOT, 'SARS-Inter_DL', 'G_Prepare', Prepare_target_dirname, mask_id)
+        Output_generated_dirpath = osp.join(HHD_ROOT, 'SARS-Inter_DL', 'G_Generate', Output_target_dirname, mask_id)
         
-        prepare_kpts_path = [osp.join(Prepare_dataset_dirpath, file) for file in os.listdir(Prepare_dataset_dirpath) if re.search(f'\w*_kpts\.npy$', file)][-1]
-        prepare_mask_path = [osp.join(Prepare_dataset_dirpath, file) for file in os.listdir(Prepare_dataset_dirpath) if re.search(f'\w*_mask\.npy$', file)][-1]
+        if not osp.exists(Output_generated_dirpath):
+            os.makedirs(Output_generated_dirpath, exist_ok=True)
+        
+        prepare_kpts_path = [osp.join(PrepareData_input_dirpath, file) for file in os.listdir(PrepareData_input_dirpath) if re.search(f'\w*_kpts\.npy$', file)][-1]
+        prepare_mask_path = [osp.join(PrepareData_input_dirpath, file) for file in os.listdir(PrepareData_input_dirpath) if re.search(f'\w*_mask\.npy$', file)][-1]
         
         assert osp.exists(prepare_kpts_path), f"prepare_kpts_path not found: {prepare_kpts_path}"
         assert osp.exists(prepare_mask_path), f"prepare_mask_path not found: {prepare_mask_path}"
@@ -458,4 +542,4 @@ if __name__ == "__main__":
         prepare_mask = np.load(prepare_mask_path)   # (N, 1, 1, 22)
         # --------------------------
     
-        main(prepare_kpts, prepare_mask, Prepare_dataset_dirpath)
+        main(prepare_kpts, prepare_mask, PrepareData_input_dirpath, Output_generated_dirpath)

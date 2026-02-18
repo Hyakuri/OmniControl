@@ -135,6 +135,7 @@ def main():
         if args.guidance_param != 1:
             model_kwargs['y']['scale'] = torch.ones(args.batch_size, device=dist_util.dev()) * args.guidance_param
 
+        #*  Generate samples from the model
         sample_fn = diffusion.p_sample_loop
 
         sample = sample_fn(
