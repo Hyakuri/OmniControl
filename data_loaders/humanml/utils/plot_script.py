@@ -361,7 +361,7 @@ def plot_compare_3d_motion(
         # 1. 左图：纯生成 (Generated)
         # ===========================
         ax1.clear()
-        init_axis(ax1, f"Generated Result\n{title}", show_grid=False)
+        init_axis(ax1, f"Generated Result\n{title}", show_grid=True) # 开启网格以便观察坐标
         
         # 画地面 (左), 地面跟随生成的 Trajectory 移动
         plot_xzPlane(
@@ -394,7 +394,7 @@ def plot_compare_3d_motion(
         # ===========================
         if ax2 is not None and hint_world is not None:
             ax2.clear()
-            init_axis(ax2, "Combined (Gen + Hint Trajectory)", show_grid=False)
+            init_axis(ax2, "Combined (Gen + Hint Trajectory)", show_grid=True) # 开启网格以便观察坐标
 
             # 地面：跟随人物 root 位移移动（世界坐标减去当前 root）
             plane = plot_xzPlane(

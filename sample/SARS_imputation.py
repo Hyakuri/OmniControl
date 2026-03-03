@@ -277,7 +277,9 @@ def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareDa
     data = load_dataset_helper(args, max_frames, n_frames)
     
     
-    # --- [新增] B2. 加载归一化统计量 (Normalization Stats) ---
+    #* 注意：如果 prepare_kpts 已经是 (N, Frames, 22, 3) 的格式，并且坐标系已经是 Y-Up，那么这里就不需要再进行适配，可以直接使用 prepare_kpts 进行后续处理。
+    #* 如果 prepare_kpts 是基于 Human3.6M 的 (N, Frames, 17, 3)，并且是 Y-Down 坐标系，那么你需要先使用 SkeletonAdapter 将其转换为 SMPL 的 (N, Frames, 22, 3) 格式，并且转换坐标系。同时需要进行归一化处理，确保数值范围与模型训练时一致。
+    # --- B2. 加载归一化统计量 (Normalization Stats) ---
     print("Loading normalization statistics...")
     spatial_norm_path = './dataset/humanml_spatial_norm'
     # 确保文件存在，路径需根据项目结构调整
@@ -305,6 +307,14 @@ def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareDa
 
     # --- D. 数据准备 ---
     print("Preparing input data...")
+    
+    # 判断 prepare_kpts 非0值点，并构造对应的掩码 (Mask)，告诉模型哪些点是有效的，哪些点是缺失的
+    # 生成 spatial_filter: (N, Frames, 22)，非0位置为 1.0，0 位置为 0.0
+    prepareKpts_validMask = (np.linalg.norm(prepare_kpts, axis=-1) > 1e-6).astype(np.float32)  # (B, Frames, 22)
+    # 调整 prepare_kpts 所有有效点的数值范围，使其与模型训练时的坐标范围一致(根据示例代码来看，所有数值都为正数，且范围大约在 0-2 之间，符合 SMPL 的坐标范围)
+    prepare_kpts[..., 1] = prepare_kpts[..., 1] + prepareKpts_validMask * raw_mean[0, 0, 1].item()  #* 将所有有效节点的 Y 轴的数值整体上移 0.9，使其范围更接近 SMPL 的坐标范围 (根据你的数据分布调整这个偏移量)
+    
+    
     # prepare_kpts 输入形状为 (B, Frames, 22, 3) -> 需要调整为 (B, Frames, 66)
     prepare_kpts = prepare_kpts.reshape(prepare_kpts.shape[0], prepare_kpts.shape[1], -1)  # (B, Frames, 22, 3) -> (B, Frames, 66)
     prepare_filter = prepare_filter  # (B, 1, 1, Frames)
@@ -341,6 +351,7 @@ def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareDa
             batch_hint_np = np.tile(target_hint_np[np.newaxis, ...], (NUM_REPETITIONS, 1, 1))
             batch_hint = torch.from_numpy(batch_hint_np).float().to(device)
             
+            #! 关键：需要后续讨论归一化处理，反归一化处理对生成结果的影响，目前先按照之前的方式进行归一化处理，确保数值范围与模型训练时一致，这样模型才能正确理解输入的 Hint 信息
             #* --- 2. 执行数据归一化 ---
             # A. 创建空间掩码 (Spatial Hint Filter)：重新筛选并标记获取的数据中哪些点是有效的（非0）
             #    注意：原始数据中 0.0 代表缺失．
@@ -353,7 +364,7 @@ def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareDa
             
             # C. 重新应用掩码：将原本是 0 的地方（现在变成了 -Mean/Std）强制置回 0
             #    这是最关键的一步，告诉模型这些点是缺失的
-            batch_norm_hint = batch_hint_norm * batch_spatial_hintFilter
+            batch_hint_norm = batch_hint_norm * batch_spatial_hintFilter
             # 现在 batch_hint_final 就是最终的归一化 Hint 输入
             # ------------------------------------------------------
             
@@ -375,7 +386,7 @@ def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareDa
                 'y': {
                     'text': batch_texts,
                     'lengths': batch_lengths,
-                    'hint': batch_norm_hint,     # (10, Frames, 66)
+                    'hint': batch_hint_norm,     # (10, Frames, 66)
                     'mask': batch_temporal_filter,     # (10, 1, 1, Frames)
                     'scale': torch.ones(NUM_REPETITIONS, device=device) * args.guidance_param
                 }
@@ -395,12 +406,12 @@ def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareDa
             
             # --- 后处理 (Batch Processing) ---
             # 1. 提取有效特征 & 反归一化
-            sample = sample[:, :263]        # why 263? 因为 HumanML3D 有 263 个有效特征
-            sample = data.dataset.t2m_dataset.inv_transform(sample.cpu().permute(0, 2, 3, 1)).float()
+            sample = sample[:, :263, ...]        # (10, 263, 1, 196). why 263? 因为 HumanML3D 有 263 个有效特征, 22个关节 * 3维 + 其他无效特征被丢弃(防止模型输出了多余的特征），如果你的模型输出已经是 66 维，那么这里就不需要切片了，直接使用 sample 就好
+            sample = data.dataset.t2m_dataset.inv_transform(sample.cpu().permute(0, 2, 3, 1)).float()   # (10, 263, 1, 196) -> (10, 1, 196, 263)，这里的 inv_transform 会自动根据训练时的归一化方式进行反归一化处理，确保数值范围回到原始坐标系下
             
             # 2. 恢复 XYZ, 为什么要恢复 XYZ? 因为模型输出的是旋转不变的坐标，需要转换回全局坐标系下的关节位置
             n_joints = 22 if sample.shape[-1] == 263 else 21
-            sample = recover_from_ric(sample, n_joints) # (10, 1, Frames, 22, 3)
+            sample = recover_from_ric(sample, n_joints) # (10, 1, 196, 263) -> (10, 1, Frames, 22, 3)
             
             # 3. 调整维度 (10, 1, Frames, 22, 3) -> (10, Frames, 22, 3)
             sample = sample.squeeze(1) # (10, Frames, 22, 3)
@@ -515,8 +526,8 @@ if __name__ == "__main__":
         HHD_ROOT = f"/media/{USER_NAME}/HHD_K/"
     
     
-    Prepare_target_dirname = "CustomDataset_20241214_GP_202602161701"
-    Output_target_dirname = "CustomDataset_20241214_GP_202512261305" + "_GG_{}".format(time.strftime('%Y%m%d%H%M', time.localtime()))
+    Prepare_target_dirname = "CustomDataset_20241214_GP_202602211819"   # 这个目录应该包含 upper/bottom/left/right/left_hand/right_hand/left_leg/right_leg/inter/norm 这几个子目录，每个子目录里有对应的 _kpts.npy 和 _mask.npy 文件
+    Output_target_dirname = Prepare_target_dirname + "_GG_{}".format(time.strftime('%Y%m%d%H%M', time.localtime()))
     
     
     
