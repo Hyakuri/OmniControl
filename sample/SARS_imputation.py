@@ -222,11 +222,11 @@ def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareDa
         os.makedirs(results_output_dirpath, exist_ok=True)
     
     
-    # Copy .npy files from prepare directory to results directory
+    # Copy .npy, .pkl, .txt files from prepare directory to results directory
     if PrepareData_input_dirpath:
         for root, dirs, files in os.walk(PrepareData_input_dirpath):
             for file in files:
-                if file.endswith('.npy') or file.endswith('.pkl'):
+                if file.endswith('.npy') or file.endswith('.pkl') or file.endswith('.txt'):
                     src = os.path.join(root, file)
                     dst = os.path.join(results_output_dirpath, 
                                       os.path.relpath(src, PrepareData_input_dirpath))
