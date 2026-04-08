@@ -206,7 +206,8 @@ def load_dataset_helper(args, max_frames, n_frames):
         data.dataset.t2m_dataset.fixed_length = n_frames
     return data
 
-def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareData_input_dirpath:str=None, results_output_dirpath:str=None):
+def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareData_input_dirpath:str=None, results_output_dirpath:str=None,
+         visualize_flag:bool=False):
     """
     该函数执行 SARS 动作补全任务，使用 OmniControl 模型根据部分观测点和文本提示生成完整的骨骼动作序列。
     
@@ -222,16 +223,17 @@ def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareDa
         os.makedirs(results_output_dirpath, exist_ok=True)
     
     
-    # Copy .npy, .pkl, .txt files from prepare directory to results directory
-    if PrepareData_input_dirpath:
-        for root, dirs, files in os.walk(PrepareData_input_dirpath):
-            for file in files:
-                if file.endswith('.npy') or file.endswith('.pkl') or file.endswith('.txt'):
-                    src = os.path.join(root, file)
-                    dst = os.path.join(results_output_dirpath, 
-                                      os.path.relpath(src, PrepareData_input_dirpath))
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    shutil.copy2(src, dst)
+    # [优化修改]：仅复制轻量的 .txt 文件用于查阅，彻底停止复制庞大且易损坏的 .pkl 和 .npy 输入数据
+    # # Copy .npy, .pkl, .txt files from prepare directory to results directory
+    # if PrepareData_input_dirpath:
+    #     for root, dirs, files in os.walk(PrepareData_input_dirpath):
+    #         for file in files:
+    #             if file.endswith('.npy') or file.endswith('.pkl') or file.endswith('.txt'):
+    #                 src = os.path.join(root, file)
+    #                 dst = os.path.join(results_output_dirpath, 
+    #                                   os.path.relpath(src, PrepareData_input_dirpath))
+    #                 os.makedirs(os.path.dirname(dst), exist_ok=True)
+    #                 shutil.copy2(src, dst)
     
     
     # --- A. 初始化 ---
@@ -260,11 +262,18 @@ def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareDa
     
     # 定义 5 种动作的文本提示 (请根据你的需求修改)
     TARGET_ACTIONS = [
-        "a person is moving forward",
-        "a person is carrying a piece of wood while walking",
-        "a person is climbing up on a ladder",
-        "a person is working for roof on a ladder",
-        "a person is working for measuring and cutting wood using a slide saw at a table"
+        # "a person is moving forward",
+        # "a person is carrying a piece of wood while walking",
+        # "a person is climbing up on a ladder",
+        # "a person is working for roof on a ladder",
+        # "a person is working for measuring and cutting wood using a slide saw at a table"
+        
+        "a person is walking forward normally",                                                                                             # move
+        "a person is walking forward while holding a heavy object in front of their chest with both hands",                                 # carry
+        "a person is climbing up a vertical ladder, moving their arms and legs upwards alternately",                                    # climb
+        "a person is standing still with their legs apart, reaching both arms upwards to interact with something above their head",     # Ladder_work
+        "a person is standing in place, bending slightly forward, and moving their hands back and forth in front of them",              # Table_work
+        
     ]
     NUM_ACTIONS = len(TARGET_ACTIONS)
     
@@ -426,45 +435,46 @@ def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareDa
             # =======================================================
             # 5. 可视化模块 (只生成 Batch 中的第 0 个样本)
             # =======================================================
-            try:
-                # A. 提取第 0 个生成的动作 (作为代表)
-                # shape: (Frames, 22, 3)
-                vis_motion = sample[0].cpu().numpy()
-                
-                # B. 准备 Hint 数据 (用于在图中画出红色的观测点)
-                # current_hint_np 是 (Frames, 66)，需要变回骨骼结构 (Frames, 22, 3)
-                vis_hint = target_hint_np.reshape(n_frames, 22, 3)
-                
-                # C. 构造文件名
-                # 格式: sample_01_action_01_climbing.mp4
-                save_title = action_text.replace(" ", "_").replace(".", "")[:20]
-                save_filename = f"sample_{sample_idx:02d}_action_{action_idx:02d}_{save_title}.mp4"
-                save_path = os.path.join(vis_output_dir, save_filename)
-                
-                # D. 调用 OmniControl 的绘图函数
-                # 注意: title 是显示在视频顶部的文字，fps 建议设为 20
-                print(f"    -> Saving visualization to {save_path} ...")
-                # plot_3d_motion(
-                #     save_path, 
-                #     kinematic_chain, 
-                #     vis_motion, 
-                #     dataset=args.dataset, 
-                #     title=action_text, 
-                #     fps=20, 
-                #     hint=vis_hint 
-                # )
-                plot_compare_3d_motion(
-                    save_path,
-                    kinematic_chain,
-                    vis_motion,
-                    dataset=args.dataset,
-                    title=action_text,
-                    fps=20,
-                    hint=vis_hint
-                )
-                
-            except Exception as e:
-                print(f"    [Warning] Visualization failed: {e}")
+            if visualize_flag:
+                try:
+                    # A. 提取第 0 个生成的动作 (作为代表)
+                    # shape: (Frames, 22, 3)
+                    vis_motion = sample[0].cpu().numpy()
+                    
+                    # B. 准备 Hint 数据 (用于在图中画出红色的观测点)
+                    # current_hint_np 是 (Frames, 66)，需要变回骨骼结构 (Frames, 22, 3)
+                    vis_hint = target_hint_np.reshape(n_frames, 22, 3)
+                    
+                    # C. 构造文件名
+                    # 格式: sample_01_action_01_climbing.mp4
+                    save_title = action_text.replace(" ", "_").replace(".", "")[:20]
+                    save_filename = f"sample_{sample_idx:02d}_action_{action_idx:02d}_{save_title}.mp4"
+                    save_path = os.path.join(vis_output_dir, save_filename)
+                    
+                    # D. 调用 OmniControl 的绘图函数
+                    # 注意: title 是显示在视频顶部的文字，fps 建议设为 20
+                    print(f"    -> Saving visualization to {save_path} ...")
+                    # plot_3d_motion(
+                    #     save_path, 
+                    #     kinematic_chain, 
+                    #     vis_motion, 
+                    #     dataset=args.dataset, 
+                    #     title=action_text, 
+                    #     fps=20, 
+                    #     hint=vis_hint 
+                    # )
+                    plot_compare_3d_motion(
+                        save_path,
+                        kinematic_chain,
+                        vis_motion,
+                        dataset=args.dataset,
+                        title=action_text,
+                        fps=20,
+                        hint=vis_hint
+                    )
+                    
+                except Exception as e:
+                    print(f"    [Warning] Visualization failed: {e}")
     
         # --- 保存该样本的所有动作结果 ---
         # 将该样本的所有动作结果堆叠
@@ -507,18 +517,68 @@ def main(prepare_kpts:np.ndarray=None, prepare_filter:np.ndarray=None, PrepareDa
     # np.save(output_path, final_result)
     # print(f"Done. Result shape: {final_result.shape}. Saved to {output_path}")
 
+# if __name__ == "__main__":
+#     # --- 强制注入命令行参数 ---
+#     # 如果检测到没有输入参数（直接点击运行时），自动填入默认参数
+#     import sys
+#     import re
+#     if len(sys.argv) == 1: 
+#         print("Detected direct run. Injecting default arguments...")
+#         sys.argv.extend([
+#             "--model_path", "./save/omnicontrol_ckpt/model_humanml3d.pt",
+#             # 如果还有其他必须参数，也可以在这里继续添加
+#             # "--text_prompt", "A person is walking" 
+#         ])
+    
+#     if sys.platform == 'win32' or sys.platform == 'cygwin':
+#         HHD_ROOT = "K:\\"
+#     elif sys.platform == 'linux':
+#         HHD_ROOT = f"/media/{USER_NAME}/HHD_K/"
+    
+    
+#     Prepare_target_dirname = "CustomDataset_20241214_GP_202603191518_noThred"   # 这个目录应该包含 upper/bottom/left/right/left_hand/right_hand/left_leg/right_leg/inter/norm 这几个子目录，每个子目录里有对应的 _kpts.npy 和 _mask.npy 文件
+#     Output_target_dirname = Prepare_target_dirname + "_GG_{}".format(time.strftime('%Y%m%d%H%M', time.localtime()))
+    
+    
+    
+#     mask_cat = ['upper', 'bottom', 'left', 'right', 'left_hand', 'right_hand', 'left_leg', 'right_leg', 'inter', 'norm']
+#     target_maskList = []
+#     for mask_id in target_maskList if len(target_maskList) > 0 else mask_cat:
+#         # if mask_id == 'norm':       continue
+        
+#         # --------------------------
+#         PrepareData_input_dirpath = osp.join(HHD_ROOT, 'SARS-Inter_DL', 'G_Prepare', Prepare_target_dirname, mask_id)
+#         Output_generated_dirpath = osp.join(HHD_ROOT, 'SARS-Inter_DL', 'G_Generate', Output_target_dirname, mask_id)
+        
+#         if not osp.exists(Output_generated_dirpath):
+#             os.makedirs(Output_generated_dirpath, exist_ok=True)
+        
+#         prepare_kpts_path = [osp.join(PrepareData_input_dirpath, file) for file in os.listdir(PrepareData_input_dirpath) if re.search(f'\w*_kpts\.npy$', file)][-1]
+#         prepare_mask_path = [osp.join(PrepareData_input_dirpath, file) for file in os.listdir(PrepareData_input_dirpath) if re.search(f'\w*_mask\.npy$', file)][-1]
+        
+#         assert osp.exists(prepare_kpts_path), f"prepare_kpts_path not found: {prepare_kpts_path}"
+#         assert osp.exists(prepare_mask_path), f"prepare_mask_path not found: {prepare_mask_path}"
+        
+#         prepare_kpts = np.load(prepare_kpts_path)   # (N, 196, 22, 3)
+#         prepare_mask = np.load(prepare_mask_path)   # (N, 1, 1, 22)
+#         # --------------------------
+    
+#         main(prepare_kpts, prepare_mask, PrepareData_input_dirpath, Output_generated_dirpath)
+
+
 if __name__ == "__main__":
     # --- 强制注入命令行参数 ---
-    # 如果检测到没有输入参数（直接点击运行时），自动填入默认参数
     import sys
     import re
+    import getpass  # [新增] 引入 getpass 以获取用户名
+    
     if len(sys.argv) == 1: 
         print("Detected direct run. Injecting default arguments...")
         sys.argv.extend([
             "--model_path", "./save/omnicontrol_ckpt/model_humanml3d.pt",
-            # 如果还有其他必须参数，也可以在这里继续添加
-            # "--text_prompt", "A person is walking" 
         ])
+    
+    USER_NAME = getpass.getuser() # [新增] 获取用户名
     
     if sys.platform == 'win32' or sys.platform == 'cygwin':
         HHD_ROOT = "K:\\"
@@ -526,31 +586,73 @@ if __name__ == "__main__":
         HHD_ROOT = f"/media/{USER_NAME}/HHD_K/"
     
     
-    Prepare_target_dirname = "CustomDataset_20241214_GP_202602211819"   # 这个目录应该包含 upper/bottom/left/right/left_hand/right_hand/left_leg/right_leg/inter/norm 这几个子目录，每个子目录里有对应的 _kpts.npy 和 _mask.npy 文件
+    visualize_flag = False   # [新增] 可视化控制开关：True 为开启画图，False 为关闭画图直接生成数据
+    
+    
+    
+    # [修改提示] 请将这里替换为 G_OmniContral_inputPrepare.py 生成的准备数据文件夹名称
+    Prepare_target_dirname = "CustomDataset_20241214_GP_202603231227_TH50"      # 这个目录应该包含 upper/bottom/left/right/left_hand/right_hand/left_leg/right_leg/inter/norm 这几个子目录，每个子目录里有对应的 _kpts.npy 和 _mask.npy 文件
     Output_target_dirname = Prepare_target_dirname + "_GG_{}".format(time.strftime('%Y%m%d%H%M', time.localtime()))
-    
-    
     
     mask_cat = ['upper', 'bottom', 'left', 'right', 'left_hand', 'right_hand', 'left_leg', 'right_leg', 'inter', 'norm']
     target_maskList = []
-    for mask_id in target_maskList if len(target_maskList) > 0 else mask_cat:
-        if mask_id == 'norm':       continue
-        
-        # --------------------------
-        PrepareData_input_dirpath = osp.join(HHD_ROOT, 'SARS-Inter_DL', 'G_Prepare', Prepare_target_dirname, mask_id)
-        Output_generated_dirpath = osp.join(HHD_ROOT, 'SARS-Inter_DL', 'G_Generate', Output_target_dirname, mask_id)
-        
-        if not osp.exists(Output_generated_dirpath):
-            os.makedirs(Output_generated_dirpath, exist_ok=True)
-        
-        prepare_kpts_path = [osp.join(PrepareData_input_dirpath, file) for file in os.listdir(PrepareData_input_dirpath) if re.search(f'\w*_kpts\.npy$', file)][-1]
-        prepare_mask_path = [osp.join(PrepareData_input_dirpath, file) for file in os.listdir(PrepareData_input_dirpath) if re.search(f'\w*_mask\.npy$', file)][-1]
-        
-        assert osp.exists(prepare_kpts_path), f"prepare_kpts_path not found: {prepare_kpts_path}"
-        assert osp.exists(prepare_mask_path), f"prepare_mask_path not found: {prepare_mask_path}"
-        
-        prepare_kpts = np.load(prepare_kpts_path)   # (N, 196, 22, 3)
-        prepare_mask = np.load(prepare_mask_path)   # (N, 1, 1, 22)
-        # --------------------------
     
-        main(prepare_kpts, prepare_mask, PrepareData_input_dirpath, Output_generated_dirpath)
+    # [核心修改 1]：引入需要遍历的模型列表，与 G_Prepare 和后续的 Integrator 保持绝对一致
+    recognize_model_list = ['stgcn', 'stgcnpp', 'ctrgcn', 'posec3d_kpts', 'posec3d_limbs', 'msg3d']
+    
+    for mask_id in target_maskList if len(target_maskList) > 0 else mask_cat:
+        # if mask_id == 'norm':       continue
+        
+        # [核心修改 2]：增加对 recognize_model_list 的遍历
+        for target_recog_model in recognize_model_list:
+            print(f"\n=======================================================")
+            print(f"🚀 Starting Generation | Mask: {mask_id} | Model: {target_recog_model.upper()}")
+            print(f"=======================================================\n")
+            
+            # [核心修改 3]：路径深入到 target_recog_model 这一级子目录
+            PrepareData_input_dirpath = osp.join(HHD_ROOT, 'SARS-Inter_DL', 'G_Prepare', Prepare_target_dirname, mask_id, target_recog_model)
+            Output_generated_dirpath = osp.join(HHD_ROOT, 'SARS-Inter_DL', 'G_Generate', Output_target_dirname, mask_id, target_recog_model)
+            
+            # 安全校验：如果某个模型在某个 mask 下没有需要补全的数据（比如精度都很高被阈值过滤了），则跳过
+            if not osp.exists(PrepareData_input_dirpath):
+                print(f"  [Info] Input dir not found (No samples to generate), skip: {PrepareData_input_dirpath}")
+                continue
+            
+            if not osp.exists(Output_generated_dirpath):
+                os.makedirs(Output_generated_dirpath, exist_ok=True)
+            
+            # 使用 raw string (r'') 修复可能引发的正则表达式转义警告
+            try:
+                prepare_kpts_path = [osp.join(PrepareData_input_dirpath, file) for file in os.listdir(PrepareData_input_dirpath) if re.search(r'\w*_kpts\.npy$', file)][-1]
+                prepare_mask_path = [osp.join(PrepareData_input_dirpath, file) for file in os.listdir(PrepareData_input_dirpath) if re.search(r'\w*_mask\.npy$', file)][-1]
+            except IndexError:
+                print(f"  [Warning] Missing .npy files in {PrepareData_input_dirpath}, skip.")
+                continue
+            
+            assert osp.exists(prepare_kpts_path), f"prepare_kpts_path not found: {prepare_kpts_path}"
+            assert osp.exists(prepare_mask_path), f"prepare_mask_path not found: {prepare_mask_path}"
+            
+            prepare_kpts = np.load(prepare_kpts_path)   # (N, 196, 22, 3)
+            prepare_mask = np.load(prepare_mask_path)   # (N, 1, 1, 196) 
+            
+            # [防呆校验]：如果提取出来的数据量为 0，跳过生成器调用，防止底层 Pytorch 崩溃
+            if prepare_kpts.shape[0] == 0:
+                print(f"  [Info] 0 samples to generate in {PrepareData_input_dirpath}, skip.")
+                
+                # [新增] 为了方便查阅，即使不需要生成数据，也创建文件夹并复制 sample_list.txt
+                import shutil
+                os.makedirs(Output_generated_dirpath, exist_ok=True)
+                try:
+                    # 寻找并复制 sample_list.txt
+                    sample_list_file = [f for f in os.listdir(PrepareData_input_dirpath) if f.endswith('_sample_list.txt')][-1]
+                    shutil.copy2(osp.join(PrepareData_input_dirpath, sample_list_file), 
+                                 osp.join(Output_generated_dirpath, sample_list_file))
+                    print(f"  [Info] Copied {sample_list_file} to Output directory for reference.")
+                except IndexError:
+                    pass
+                
+                continue
+            
+            # --------------------------
+            # 正式调用 OmniControl 进行推理生成
+            main(prepare_kpts, prepare_mask, PrepareData_input_dirpath, Output_generated_dirpath, visualize_flag=visualize_flag)
